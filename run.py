@@ -41,21 +41,31 @@ Instructions:
 
 Answers:"""
 
-CHUNK_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the chunked context and questions to answer.
+CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context>. If and only if the policy lacks the answer, you may use <WebSnippets>.
+
+Decision rule:
+1) Search ALL of <Context>. If the answer exists there, answer ONLY from <Context>.
+2) If the answer is NOT in <Context>, search <WebSnippets>. If found there, answer from <WebSnippets> and keep it concise.
+3) If the answer is in neither source, reply exactly: "Not mentioned in the policy."
+
+Requirements:
+- Quote every number, amount, time period, percentage, sub-limit, definition, eligibility, exclusion, waiting period, and condition **word-for-word**.
+- If Yes/No, start with “Yes.” or “No.” and immediately quote the rule that makes it so.
+- Include all applicable conditions in a compact way.
+- No clause numbers, no speculation, no invented facts.
+
 Context:
 {context}
+
+WebSnippets:
+{web_snippets}
 
 Questions:
 {query}
 
-Instructions:
-1. Combine insights from all chunks.
-2. Don’t repeat content.
-3. If answer not found, reply: "Not mentioned in the policy."
-4. Be concise (max one paragraph/answer).
-5. Give each answer in a single paragraph without numbering.
+Answers (one concise paragraph per question, no bullets, no numbering):
+"""
 
-Answers:"""
 
 WEB_PROMPT_TEMPLATE = """You are an expert insurance policy assistant. Based on the document titled "{title}", answer the following questions using general or public insurance knowledge.
 Title: "{title}"
