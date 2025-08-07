@@ -233,3 +233,22 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
     tasks   = [get_answer(i, q) for i, q in enumerate(request.questions)]
     answers = await asyncio.gather(*tasks)
     return {"answers": answers}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

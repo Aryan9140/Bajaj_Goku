@@ -19,7 +19,7 @@ rapidfuzz
 sentence_transformers
 # torch --extra-index-url https://download.pytorch.org/whl/cpu
 
-
+faiss-cpu
 pillow
 pytesseract
 pinecone-client
