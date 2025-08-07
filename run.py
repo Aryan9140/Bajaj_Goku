@@ -131,7 +131,7 @@ def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size=2000, overlap=250) -> List[str]:
+def split_text(text: str, chunk_size=1200, overlap=150) -> List[str]:
     chunks, start = [], 0
     while start < len(text):
         chunks.append(text[start:start + chunk_size])
