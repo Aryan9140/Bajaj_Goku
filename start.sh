@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+##!/usr/bin/env bash
 # start.sh
 
 # Run FastAPI with uvicorn (recommended for production)
