@@ -1,30 +1,53 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import List
-import os, requests, fitz, tempfile, io, asyncio, time, re
+import os, tempfile, io, time, re
+import fitz
 from PIL import Image
 import pytesseract
-import httpx
+import requests, httpx
 from dotenv import load_dotenv
+
+# ---------------- App & Clients ----------------
+app = FastAPI()
+
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+REQUESTS_SESSION = requests.Session()
+REQUESTS_SESSION.headers.update({"Accept-Encoding": "gzip, deflate"})
+REQUESTS_SESSION.mount(
+    "https://",
+    HTTPAdapter(
+        pool_connections=20, pool_maxsize=20,
+        max_retries=Retry(total=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
+    ),
+)
+
+ASYNC_CLIENT = httpx.AsyncClient(
+    http2=True,
+    timeout=20.0,
+    headers={"Accept-Encoding": "gzip, deflate"},
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await ASYNC_CLIENT.aclose()
 
 load_dotenv()
 
-
-
-#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-API_TOKEN = os.getenv("API_TOKEN")
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
+API_TOKEN       = os.getenv("API_TOKEN")
 
-app = FastAPI()
-
-
-
+# ---------------- Schemas ----------------
 class RunRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# ---------------- Prompts ----------------
 FULL_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the information provided in the context to answer the questions.
 Context:
 {context}
@@ -66,7 +89,6 @@ Questions:
 Answers (one concise paragraph per question, no bullets, no numbering):
 """
 
-
 WEB_PROMPT_TEMPLATE = """You are an expert insurance policy assistant. Based on the document titled "{title}", answer the following questions using general or public insurance knowledge.
 Title: "{title}"
 
@@ -81,174 +103,231 @@ Instructions:
 
 Answers:"""
 
-# Extract text from PDF (OCR if needed)
-def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
-    response = requests.get(pdf_url)
-    response.raise_for_status()
+# ---------------- Helpers ----------------
+def approx_tokens_from_text(s: str) -> int:
+    return max(1, len(s) // 4)
 
+def choose_mistral_params(page_count: int, context_text: str | None):
+    ctx_tok = approx_tokens_from_text(context_text or "")
+    if page_count <= 100:
+        max_tokens, temperature, timeout = 1100, 0.3, 15
+    elif page_count <= 200:
+        max_tokens, temperature, timeout = 900, 0.3, 15
+    else:
+        max_tokens, temperature, timeout = 800, 0.25, 12
+    total_budget = 3500
+    budget_left = max(600, total_budget - ctx_tok)
+    return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
+
+def choose_groq_params(page_count: int, context_text: str | None):
+    ctx_tok = approx_tokens_from_text(context_text or "")
+    if page_count <= 100:
+        max_tokens, temperature, timeout = 1600, 0.2, 30
+    elif page_count <= 200:
+        max_tokens, temperature, timeout = 1600, 0.2, 30
+    else:
+        max_tokens, temperature, timeout = 1500, 0.18, 25
+    total_budget = 3500
+    budget_left = max(800, total_budget - ctx_tok)
+    return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
+
+def make_question_block(questions: List[str]) -> str:
+    return "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+
+# ---------------- PDF Extraction ----------------
+def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
+    r = REQUESTS_SESSION.get(pdf_url, timeout=20)
+    r.raise_for_status()
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(response.content)
+        tmp.write(r.content)
         tmp_path = tmp.name
 
-    full_text = ""
-    title = ""
+    full_text, title = "", ""
     with fitz.open(tmp_path) as doc:
         page_count = len(doc)
 
-        # Title extraction
+        # Title
         for i in range(min(15, page_count)):
-            page = doc[i]
-            text = page.get_text().strip()
-
-            if not text:
+            t = (doc[i].get_text() or "").strip()
+            if not t:
                 try:
-                    pix = page.get_pixmap(dpi=100)
+                    pix = doc[i].get_pixmap(dpi=100)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
-                    text = pytesseract.image_to_string(img, lang="eng").strip()
-                except:
+                    t = pytesseract.image_to_string(img, lang="eng").strip()
+                except Exception:
                     continue
-
-            if text:
-                title = text.split('\n')[0][:100]
+            if t:
+                title = t.splitlines()[0][:100]
                 break
 
-        # Full extraction only if ≤ 200 pages
+        # Full text (<=200 pages)
         if page_count <= 200:
             for i in range(page_count):
-                page = doc[i]
-                text = page.get_text().strip()
-
-                if not text:
+                t = (doc[i].get_text() or "").strip()
+                if not t:
                     try:
-                        pix = page.get_pixmap(dpi=100)
+                        pix = doc[i].get_pixmap(dpi=100)
                         img = Image.open(io.BytesIO(pix.tobytes("png")))
-                        text = pytesseract.image_to_string(img, lang="eng").strip()
-                    except:
-                        continue
-
-                full_text += text + "\n"
+                        t = pytesseract.image_to_string(img, lang="eng").strip()
+                    except Exception:
+                        t = ""
+                if t:
+                    full_text += t + "\n"
 
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
 def split_text(text: str, chunk_size=1200, overlap=150) -> List[str]:
     chunks, start = [], 0
-    while start < len(text):
+    n = len(text)
+    while start < n and len(chunks) < 15:
         chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
-    return chunks[:15]
+    return chunks
 
-
-# Mistral LLM to respond to questions
-
-def call_mistral(prompt: str) -> str:
+# ---------------- LLM Calls ----------------
+def call_mistral(prompt: str, params: dict) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "mistral-small-latest",
-        "temperature": 0.7,
+        "temperature": params.get("temperature", 0.3),
         "top_p": 1,
-        "max_tokens": 1000,
-        "messages": [{"role": "user", "content": prompt}]
+        "max_tokens": params.get("max_tokens", 1000),
+        "messages": [{"role": "user", "content": prompt}],
     }
-    res = requests.post(url, headers=headers, json=payload, timeout=15)
-    res.raise_for_status()
-    return res.json()["choices"][0]["message"]["content"]
+    r = REQUESTS_SESSION.post(url, headers=headers, json=payload, timeout=params.get("timeout", 15))
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
-def call_mistral_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
-    question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
-    combined_context = "\n\n".join(chunks)
-    prompt = CHUNK_PROMPT_TEMPLATE.format(context=combined_context, query=question_block)
-    answer = call_mistral(prompt)
-    return [a.strip() for a in answer.split("\n") if a.strip()]
+def _score_chunk(q: str, c: str) -> int:
+    WORD_RX = re.compile(r"\w+")
+    NUM_RX  = re.compile(r"\d+%?")
+    qt = set(WORD_RX.findall(q.lower()))
+    ct = set(WORD_RX.findall(c.lower()))
+    base = len(qt & ct)
+    num_bonus = 2 * len(set(NUM_RX.findall(q)) & set(NUM_RX.findall(c)))
+    return base + num_bonus
 
-# Groq fallback
-async def call_groq_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
-    question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+def _topk_chunks(q: str, chunks: List[str], k=4) -> List[str]:
+    scored = sorted((( _score_chunk(q, c), c) for c in chunks), key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:k]] if scored else []
 
-    async def call_chunk(chunk):
-        prompt = CHUNK_PROMPT_TEMPLATE.format(context=chunk, query=question_block)
+KEY_LINE_RX = re.compile(
+    r'(\b\d+\s*(day|days|month|months|year|years|%)\b|sub-?limit|room rent|ICU|AYUSH|grace|waiting|'
+    r'deductible|co-?pay|exclusion|PED|check[-\s]?up|sum insured|premium|pre[-\s]?auth|pre[-\s]?existing)',
+    re.I
+)
+
+def _harvest_numeric_lines(text: str, max_lines=60) -> str:
+    seen, out = set(), []
+    for ln in (l.strip() for l in text.splitlines() if l.strip()):
+        if KEY_LINE_RX.search(ln) and ln not in seen:
+            seen.add(ln); out.append(ln)
+            if len(out) >= max_lines: break
+    return "\n".join(out)
+
+def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
+    answers = []
+    for q in questions:
+        kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
+        combined = "\n\n".join(kchunks)
+        evidence = _harvest_numeric_lines(combined)
+        context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
+        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
+        ans = call_mistral(prompt, params).strip()
+        answers.append(ans)
+    return answers
+
+async def call_groq_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
+    # single-batch (one prompt per question) using top-k chunks too
+    answers = []
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    async def ask(q: str):
+        kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
+        combined = "\n\n".join(kchunks)
+        evidence = _harvest_numeric_lines(combined)
+        context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
+        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
         payload = {
             "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-            "temperature": 0.3,
+            "temperature": params.get("temperature", 0.3),
             "top_p": 1,
-            "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompt}]
+            "max_tokens": params.get("max_tokens", 1000),
+            "messages": [{"role": "user", "content": prompt}],
         }
-        async with httpx.AsyncClient() as client:
-            res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
-            res.raise_for_status()
-            return res.json()["choices"][0]["message"]["content"]
+        r = await ASYNC_CLIENT.post(url, headers=headers, json=payload, timeout=params.get("timeout", 20))
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
 
-    responses = await asyncio.gather(*[call_chunk(chunk) for chunk in chunks])
-    all_answers = "\n".join(responses)
-    return [a.strip() for a in all_answers.split("\n") if a.strip()]
+    results = await asyncio.gather(*[ask(q) for q in questions])
+    answers.extend(results)
+    return answers
 
+# ---------------- Routes ----------------
 @app.get("/")
 def read_root():
     return {"message": "PDF API is running"}
 
-# Main Endpoint
 @app.post("/api/v1/hackrx/run")
 async def run_analysis(request: RunRequest, authorization: str = Header(...)):
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     try:
-        start_time = time.time()
+        start = time.time()
 
         full_text, page_count, title = extract_text_from_pdf_url(request.documents)
         chunks = split_text(full_text) if full_text else []
-        question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
 
-        # Case 1: Full PDF (<= 100 pages)
-
-
+        # <= 100 pages: full context (Mistral primary)
         if page_count <= 100:
             try:
-                prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=question_block)
-                response = call_mistral(prompt)
-                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in response.split("\n") if a.strip()]
+                m_params = choose_mistral_params(page_count, full_text)
+                prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=make_question_block(request.questions))
+                resp = call_mistral(prompt, m_params)
+                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in resp.split("\n") if a.strip()]
                 return {"answers": answers}
             except Exception:
-                raise HTTPException(status_code=500, detail="Mistral failed on full content.")
+                try:
+                    g_params = choose_groq_params(page_count, full_text)
+                    answers = await call_groq_on_chunks([full_text], request.questions, g_params)
+                    return {"answers": answers}
+                except Exception:
+                    raise HTTPException(status_code=500, detail="Both LLMs failed on full content.")
 
-        # Case 2: Chunked PDF (<= 200 pages)
-
+        # 101–200 pages: chunked (Mistral primary, Groq secondary)
         elif page_count <= 200:
             try:
-                answers = call_mistral_on_chunks(chunks, request.questions)
+                m_params = choose_mistral_params(page_count, "\n\n".join(chunks))
+                answers = call_mistral_on_chunks(chunks, request.questions, m_params)
                 return {"answers": answers}
-            except:
+            except Exception:
                 try:
-                    answers = await call_groq_on_chunks(chunks, request.questions)
+                    g_params = choose_groq_params(page_count, "\n\n".join(chunks))
+                    answers = await call_groq_on_chunks(chunks, request.questions, g_params)
                     return {"answers": answers}
-                except:
+                except Exception:
                     raise HTTPException(status_code=500, detail="All LLMs failed for chunks.")
 
-        # Case 3: Large (> 200 pages) → Use title and public info
-        
+        # > 200 pages: public info/title path (Mistral primary, Groq secondary)
         else:
             try:
-                prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=question_block)
-                response = call_mistral(prompt)
-                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in response.split("\n") if a.strip()]
+                m_params = choose_mistral_params(page_count, title)
+                prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=make_question_block(request.questions))
+                resp = call_mistral(prompt, m_params)
+                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in resp.split("\n") if a.strip()]
                 return {"answers": answers}
-            except:
+            except Exception:
                 try:
-                    answers = await call_groq_on_chunks([title], request.questions)
+                    g_params = choose_groq_params(page_count, title)
+                    answers = await call_groq_on_chunks([title], request.questions, g_params)
                     return {"answers": answers}
-                except:
+                except Exception:
                     raise HTTPException(status_code=500, detail="All LLMs failed for >200 page fallback.")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        print(f"⏱ Total processing time: {round(time.time() - start_time, 2)}s")
+        print(f"⏱ Total processing time: {round(time.time() - start, 2)}s")
