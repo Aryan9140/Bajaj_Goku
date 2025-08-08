@@ -7,3 +7,4 @@ python-dotenv
 pillow
 PyMuPDF
 pytesseract
+httpx[http2]
