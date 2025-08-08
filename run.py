@@ -1,11 +1,12 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header 
 from pydantic import BaseModel
 from typing import List
-import os, tempfile, io, time, re
+import os, tempfile, io, time, re 
 import fitz
 from PIL import Image
+import asyncio
 import pytesseract
-import requests, httpx
+import requests, httpx 
 from dotenv import load_dotenv
 
 # ---------------- App & Clients ----------------
@@ -109,27 +110,31 @@ def approx_tokens_from_text(s: str) -> int:
 
 def choose_mistral_params(page_count: int, context_text: str | None):
     ctx_tok = approx_tokens_from_text(context_text or "")
-    if page_count <= 100:
-        max_tokens, temperature, timeout = 1100, 0.3, 15
+    if page_count <= 60:
+        max_tokens, temperature, timeout = 1100, 0.20, 12
     elif page_count <= 200:
-        max_tokens, temperature, timeout = 900, 0.3, 15
+        max_tokens, temperature, timeout = 1500, 0.22, 15
     else:
-        max_tokens, temperature, timeout = 800, 0.25, 12
-    total_budget = 3500
-    budget_left = max(600, total_budget - ctx_tok)
+        max_tokens, temperature, timeout = 900, 0.18, 10
+    total_budget = 4000
+    budget_left = max(700, total_budget - ctx_tok)
     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
+
+
 
 def choose_groq_params(page_count: int, context_text: str | None):
     ctx_tok = approx_tokens_from_text(context_text or "")
     if page_count <= 100:
-        max_tokens, temperature, timeout = 1600, 0.2, 30
+        max_tokens, temperature, timeout = 1300, 0.15, 30
     elif page_count <= 200:
-        max_tokens, temperature, timeout = 1600, 0.2, 30
+        max_tokens, temperature, timeout = 1700, 0.15, 30
     else:
-        max_tokens, temperature, timeout = 1500, 0.18, 25
-    total_budget = 3500
-    budget_left = max(800, total_budget - ctx_tok)
+        max_tokens, temperature, timeout = 1100, 0.12, 25
+    total_budget = 4000
+    budget_left = max(900, total_budget - ctx_tok)
     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
+
+
 
 def make_question_block(questions: List[str]) -> str:
     return "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
@@ -177,15 +182,16 @@ def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size=1200, overlap=150) -> List[str]:
+def split_text(text: str, chunk_size=1300, overlap=200) -> List[str]:
     chunks, start = [], 0
     n = len(text)
-    while start < n and len(chunks) < 15:
+    while start < n and len(chunks) < 14:
         chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
     return chunks
 
 # ---------------- LLM Calls ----------------
+
 def call_mistral(prompt: str, params: dict) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
@@ -219,7 +225,7 @@ KEY_LINE_RX = re.compile(
     re.I
 )
 
-def _harvest_numeric_lines(text: str, max_lines=60) -> str:
+def _harvest_numeric_lines(text: str, max_lines=50) -> str:
     seen, out = set(), []
     for ln in (l.strip() for l in text.splitlines() if l.strip()):
         if KEY_LINE_RX.search(ln) and ln not in seen:
@@ -273,6 +279,7 @@ def read_root():
 
 @app.post("/api/v1/hackrx/run")
 async def run_analysis(request: RunRequest, authorization: str = Header(...)):
+    print(f"🔍🔍🔍 Processing request for {len(request.questions)} questions on {request.documents}")
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
@@ -282,6 +289,7 @@ async def run_analysis(request: RunRequest, authorization: str = Header(...)):
         chunks = split_text(full_text) if full_text else []
 
         # <= 100 pages: full context (Mistral primary)
+
         if page_count <= 100:
             try:
                 m_params = choose_mistral_params(page_count, full_text)
