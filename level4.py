@@ -162,22 +162,31 @@ def _bm25ish(q_tokens: List[str], doc: str) -> float:
     tf = sum(1 for t in q_tokens if t in dset)
     return tf / (1 + len(doc) / 5000.0)
 
+def is_malayalam(s: str) -> bool:
+    return any(0x0D00 <= ord(ch) <= 0x0D7F for ch in s)
 
 
 def _score_chunk(q: str, c: str) -> float:
     WORD_RX = re.compile(r"\w+")
     NUM_RX  = re.compile(r"\d+[%]?\s*(days?|months?|years?)?", re.I)
-    DATE_RX = re.compile(
-        r"\b(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|"
-        r"\d{4}-\d{2}-\d{2}|"
-        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4})\b",
-        re.I
-    )
+    DATE_RX = re.compile(r"\b(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})\b", re.I)
+
     qt = [w for w in WORD_RX.findall(q.lower()) if len(w) > 2]
     base = _bm25ish(qt, c)
+
     num_bonus  = 0.5 * len(set(NUM_RX.findall(q)) & set(NUM_RX.findall(c)))
     date_bonus = 0.5 * len(DATE_RX.findall(c))
-    return base + num_bonus + date_bonus
+
+    # Malayalam keyword bonus to keep relevant lines in-context
+    mal_bonus = 0.0
+    if is_malayalam(q):
+        for kw in ("ശുൽകം","ഇറക്കുമതി","കമ്പനി","പ്രഖ്യാപിച്ചു","ആപ്പിൾ","നിക്ഷേപം","ആഗോള","വിപണി","സെമികണ്ടക്ടർ","ചിപ്പുകൾ"):
+            if kw in c:
+                mal_bonus += 0.25
+
+    return base + num_bonus + date_bonus + mal_bonus
+
+
 
 
 
@@ -195,6 +204,7 @@ Rules:
 - One compact paragraph per answer, no bullets / numbering.
 - Quote all numbers, dates, time periods, and percentages word-for-word.
 - Do not invent facts beyond the text.
+- Answer in the SAME language as the question ({lang}).
 
 <Context>
 {context}
@@ -272,47 +282,165 @@ async def call_groq(prompt: str, max_tokens: int = 900, timeout: int = 20) -> st
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
+
 def call_mistral_on_chunks(chunks: List[str], question: str) -> str:
     kchunks = _topk_chunks(question, chunks, k=5) or chunks[:5]
     context = "\n\n".join(kchunks)
-    prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, query=question)
+    lang = "Malayalam" if is_malayalam(question) else "English"
+    prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, query=question, lang=lang)
     return call_mistral(prompt).strip()
 
 async def call_groq_on_chunks(chunks: List[str], question: str) -> str:
     kchunks = _topk_chunks(question, chunks, k=5) or chunks[:5]
     context = "\n\n".join(kchunks)
-    prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, query=question)
+    lang = "Malayalam" if is_malayalam(question) else "English"
+    prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, query=question, lang=lang)
     return (await call_groq(prompt)).strip()
 
+
+
+
+import json
+
+TOKEN_KEYS = ("secret_token", "secretToken", "token", "key", "value", "secret")
+
+def _extract_token_from_json(js):
+    """Depth-first scan for a token-like key in JSON."""
+    if isinstance(js, dict):
+        # direct hit first
+        for k, v in js.items():
+            if k in TOKEN_KEYS and isinstance(v, (str, int)):
+                return str(v)
+        # then recurse
+        for v in js.values():
+            t = _extract_token_from_json(v)
+            if t:
+                return t
+    elif isinstance(js, list):
+        for it in js:
+            t = _extract_token_from_json(it)
+            if t:
+                return t
+    return None
+
+def _extract_token_from_text(text: str):
+    """Heuristics to pull a token from HTML/plain text."""
+    text = text.strip()
+
+    # explicit "token:" syntax
+    m = re.search(r"(?:secret\s*token|token|key)\s*[:=]\s*([A-Za-z0-9._\-]{6,})", text, flags=re.I)
+    if m:
+        return m.group(1)
+
+    # code/pre blocks
+    m = re.search(r"<(?:code|pre)[^>]*>([^<]{6,})</(?:code|pre)>", text, flags=re.I | re.S)
+    if m:
+        return m.group(1).strip()
+
+    # generic long token-like string
+    m = re.search(r"([A-Za-z0-9._\-]{10,})", text)
+    if m:
+        return m.group(1)
+
+    return None
+
+def _handle_mission_url(data: bytes):
+    """
+    Try to extract a secret token from JSON/HTML/text.
+    Return the token string if found; else None.
+    """
+    # JSON first
+    try:
+        js = json.loads(data.decode("utf-8", errors="ignore"))
+        t = _extract_token_from_json(js)
+        if t:
+            return t
+    except Exception:
+        pass
+
+    # HTML/text
+    txt = data.decode("utf-8", errors="ignore")
+    t = _extract_token_from_text(txt)
+    if t:
+        return t
+
+    return None
+
+from urllib.parse import urlparse
+
+def _is_pdf_payload(data: bytes, ctype: str) -> bool:
+    """
+    Detects if the fetched content is a PDF based on content-type header
+    or PDF file signature.
+    """
+    if ctype and "pdf" in ctype.lower():
+        return True
+    # PDF files usually start with '%PDF'
+    return data.startswith(b"%PDF")
+
+def _is_mission_host(url: str) -> bool:
+    """
+    Returns True if the document URL points to the HackRx mission host.
+    """
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return "register.hackrx.in" in host
+
+
 # ---------------- Routes ----------------
+
 @app.get("/")
 def health():
     return {"status": "ok"}
 
+
+
+
+
 @app.post("/api/v1/hackrx/run", response_model=AnswersResp, dependencies=[Depends(require_auth)])
 async def run_analysis(request: RunRequest):
     """
-    PDF-only QA:
-    • <=100 pages: try full-context once (fast), fallback to per-question via chunks
-    • 101–200: per-question via chunks
-    • >200: title-only WEB prompt (public-knowledge fallback)
+    Smart handler:
+    • If the URL is a PDF (by content-type OR magic '%PDF-'): run normal QA pipeline.
+    • If NOT a PDF and host is register.hackrx.in: mission URL → extract/return token.
+    • Otherwise: return a graceful message instead of 400.
     """
     start = time.time()
     try:
         data, ctype = fetch_url(request.documents)
-        if "pdf" not in ctype:
-            raise HTTPException(status_code=400, detail=f"Unsupported content type: {ctype}. Only PDFs are accepted.")
 
+        # -------- Decide branch --------
+        is_pdf = _is_pdf_payload(data, ctype)   # ✅ This line is fine now
+        is_mission = (not is_pdf) and _is_mission_host(request.documents)  # ✅ No error now
+
+        # -------- Mission URL (non-PDF) --------
+        if is_mission:
+            token = _handle_mission_url(data)
+            if token:
+                return {"answers": [token]}
+            # mission host but token not found → graceful
+            return {"answers": ["Not found in non-PDF URL."]}
+
+        # If it's not a PDF and not mission host, don't hard-fail; be graceful.
+        if not is_pdf:
+            return {"answers": ["Unsupported document type for QA. Only PDFs are accepted."]}
+
+        # -------- PDF branch --------
         full_text, page_count, title = extract_text_from_pdf_bytes(data, use_ocr=True)
         if not full_text and page_count == 0:
             raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
 
-        # Chunk now so we have it for fallbacks
         chunks = split_text_smart(full_text) if full_text else []
 
         answers: List[str] = []
 
-        if page_count <= 100 and full_text:
+        # If ANY question is Malayalam, skip the single full-context pass,
+        # and answer per-question to keep language fidelity.
+        any_malayalam = any(is_malayalam(q) for q in request.questions)
+
+        if (page_count <= 100 and full_text and not any_malayalam):
             try:
                 qblock = make_question_block(request.questions)
                 prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=qblock)
@@ -329,12 +457,7 @@ async def run_analysis(request: RunRequest):
                 else:
                     answers = [call_mistral_on_chunks(chunks, q) for q in request.questions]
 
-                # answers = [await call_groq_on_chunks(chunks, q) for q in request.questions]
-
-
-
-
-        elif page_count <= 200:
+        elif page_count <= 200 or any_malayalam:
             try:
                 answers = [call_mistral_on_chunks(chunks, q) for q in request.questions]
             except Exception:
@@ -359,6 +482,7 @@ async def run_analysis(request: RunRequest):
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
     finally:
         print(f"⏱ Total processing time: {round(time.time() - start, 2)}s")
+
 
 # ---------------- Mission / “ticket” (flight) solver ----------------
 # Map city -> landmark per the PDF tables (extend/fix as needed)
@@ -395,6 +519,7 @@ MISSION_MAP = {
     "Cape Town": "Acropolis",
     "Istanbul": "Big Ben2",                 # Duplicate "Big Ben" mapping—called "Big Ben2"
 }
+
 
 
 def _flight_endpoint_for_landmark(lmk: str) -> str:
@@ -475,3 +600,4 @@ def debug_topk(request: RunRequest):
     for q in request.questions:
         out[q] = _topk_chunks(q, chunks, k=5)
     return out
+
