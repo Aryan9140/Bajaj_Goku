@@ -1,603 +1,622 @@
-# main.py — Multilingual PDF-QA + Mission Solver (deterministic, <20s target)
-# Run: uvicorn main:app --host 0.0.0.0 --port 8000
-# Env required: API_TOKEN (required), MISTRAL_API_KEY (optional), GROQ_API_KEY (optional)
-# OCR: install tesseract + needed lang packs; export TESSDATA_PREFIX if required.
-
-from fastapi import FastAPI, HTTPException, Header, Depends
-from pydantic import BaseModel
-from typing import List, Optional, Tuple, Dict
-import os, io, re, time, tempfile, mimetypes, unicodedata
-
-import requests, httpx
-import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
-from dotenv import load_dotenv
-load_dotenv(override=True)  # ensures your .env wins locally
-
-
-# ---------------- App ----------------
-app = FastAPI(title="HackRx PDF QA + Mission Solver")
-
-# ---------------- Env ----------------
-API_TOKEN = os.getenv("API_TOKEN", "").strip()
-if not API_TOKEN:
-    raise RuntimeError("API_TOKEN must be set and non-empty.")
-
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
-
-# OCR languages to load in Tesseract (ensure traineddata installed)
-TESS_LANGS = os.getenv("TESS_LANGS", "eng+mal+hin")  # adjust as needed (e.g., eng+mal+hin+tam)
-
-# ---------------- HTTP Clients w/ retry ----------------
-import urllib3
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-REQUESTS_SESSION = requests.Session()
-REQUESTS_SESSION.headers.update({"Accept-Encoding": "gzip, deflate"})
-REQUESTS_SESSION.mount(
-    "https://",
-    HTTPAdapter(
-        pool_connections=24, pool_maxsize=24,
-        max_retries=Retry(total=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
-    ),
-)
-
-ASYNC_CLIENT = httpx.AsyncClient(
-    http2=True,
-    timeout=20.0,
-    headers={"Accept-Encoding": "gzip, deflate"},
-    limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
-)
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await ASYNC_CLIENT.aclose()
-
-# ---------------- Schemas ----------------
-class RunRequest(BaseModel):
-    documents: str
-    questions: List[str]
-
-class AnswersResp(BaseModel):
-    answers: List[str]
-
-# ---------------- Auth ----------------
-def _bearer_token(h: Optional[str]) -> Optional[str]:
-    if not h: return None
-    p = h.split()
-    return p[1] if len(p) == 2 and p[0].lower() == "bearer" else None
-
-def require_auth(authorization: Optional[str] = Header(None, alias="Authorization")):
-    if _bearer_token(authorization) != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# ---------------- Utils ----------------
-def _clean_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\s*\n\s*", "\n", s)
-    return s.strip()
-
-def fetch_url(url: str, timeout: int = 25) -> Tuple[bytes, str]:
-    r = REQUESTS_SESSION.get(url, timeout=timeout, stream=True)
-    r.raise_for_status()
-    ctype = (r.headers.get("Content-Type") or "").split(";")[0].lower().strip()
-    data = r.content
-    if not ctype:
-        guess = mimetypes.guess_type(url)[0] or ""
-        ctype = guess.lower()
-    return data, ctype
-
-# ---------------- Extraction (prefers Markdown via pymupdf4llm) ----------------
-def extract_text_from_pdf_bytes(data: bytes, use_ocr: bool = True) -> Tuple[str, int, str]:
-    try:
-        from pymupdf4llm import to_markdown  # pip install pymupdf4llm
-    except Exception:
-        to_markdown = None
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
-    title, full_text, page_count = "", "", 0
-    try:
-        with fitz.open(tmp_path) as doc:
-            page_count = len(doc)
-
-            # title (first few pages)
-            for i in range(min(6, page_count)):
-                t = (doc[i].get_text("text", sort=True) or "").strip()
-                if not t and use_ocr:
-                    pix = doc[i].get_pixmap(dpi=200)
-                    img = Image.open(io.BytesIO(pix.tobytes("png")))
-                    t = pytesseract.image_to_string(img, lang=TESS_LANGS).strip()
-                if t:
-                    title = t.splitlines()[0][:120]
-                    break
-
-            if to_markdown:
-                full_text = to_markdown(tmp_path)  # layout-aware Markdown extraction
-            else:
-                buf = []
-                for i in range(page_count):
-                    t = doc[i].get_text("text", sort=True) or ""
-                    if not t and use_ocr:
-                        pix = doc[i].get_pixmap(dpi=150)
-                        img = Image.open(io.BytesIO(pix.tobytes("png")))
-                        t = pytesseract.image_to_string(img, lang=TESS_LANGS)
-                    if t:
-                        buf.append(t)
-                full_text = "\n".join(buf)
-    finally:
-        os.remove(tmp_path)
-
-    return (_clean_text(full_text), page_count, (title or "Untitled Document").strip())
-
-# ---------------- Chunking (sentence-aware) ----------------
-def split_text_smart(text: str, max_chars: int = 5000, overlap: int = 600, max_chunks: int = 30) -> List[str]:
-    # ~1000 tokens/chunk; 15–20% overlap; hard-cap chunk count for latency
-    sents = re.split(r'(?<=[\.\?\!])\s+', text)
-    chunks, cur = [], ""
-    for s in sents:
-        if len(cur) + len(s) + 1 <= max_chars:
-            cur += ((" " if cur else "") + s)
-        else:
-            if cur:
-                chunks.append(cur.strip())
-            carry = cur[-overlap:] if overlap and len(cur) > overlap else cur
-            cur = (carry + " " + s).strip()
-            if len(chunks) >= max_chunks:
-                break
-    if cur and len(chunks) < max_chunks:
-        chunks.append(cur.strip())
-    return chunks
-
-# ---------------- Retrieval (hybrid lexical + numeric) ----------------
-def _bm25ish(q_tokens: List[str], doc: str) -> float:
-    doc_tokens = re.findall(r"\w+", doc.lower())
-    dset = set(doc_tokens)
-    tf = sum(1 for t in q_tokens if t in dset)
-    return tf / (1 + len(doc) / 5000.0)
-
-def is_malayalam(s: str) -> bool:
-    return any(0x0D00 <= ord(ch) <= 0x0D7F for ch in s)
-
-
-def _score_chunk(q: str, c: str) -> float:
-    WORD_RX = re.compile(r"\w+")
-    NUM_RX  = re.compile(r"\d+[%]?\s*(days?|months?|years?)?", re.I)
-    DATE_RX = re.compile(r"\b(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{4}-\d{2}-\d{2})\b", re.I)
-
-    qt = [w for w in WORD_RX.findall(q.lower()) if len(w) > 2]
-    base = _bm25ish(qt, c)
-
-    num_bonus  = 0.5 * len(set(NUM_RX.findall(q)) & set(NUM_RX.findall(c)))
-    date_bonus = 0.5 * len(DATE_RX.findall(c))
-
-    # Malayalam keyword bonus to keep relevant lines in-context
-    mal_bonus = 0.0
-    if is_malayalam(q):
-        for kw in ("ശുൽകം","ഇറക്കുമതി","കമ്പനി","പ്രഖ്യാപിച്ചു","ആപ്പിൾ","നിക്ഷേപം","ആഗോള","വിപണി","സെമികണ്ടക്ടർ","ചിപ്പുകൾ"):
-            if kw in c:
-                mal_bonus += 0.25
-
-    return base + num_bonus + date_bonus + mal_bonus
-
-
-
-
-
-
-def _topk_chunks(q: str, chunks: List[str], k=5) -> List[str]:
-    scored = sorted((( _score_chunk(q, c), c) for c in chunks), key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:k]]
-
-
-
-# ---------------- Prompts (ALL THREE) ----------------
-CHUNK_PROMPT_TEMPLATE = """You are a policy assistant. Answer ONLY from <Context>. If not found there, reply exactly: "Not mentioned in the policy."
-
-Rules:
-- One compact paragraph per answer, no bullets / numbering.
-- Quote all numbers, dates, time periods, and percentages word-for-word.
-- Do not invent facts beyond the text.
-- Answer in the SAME language as the question ({lang}).
-
-<Context>
-{context}
-</Context>
-
-<Question>
-{query}
-</Question>
-
-<Answer>"""
-
-FULL_PROMPT_TEMPLATE = """You are a policy assistant. Use ONLY this context.
-
-Context:
-{context}
-
-Questions:
-{query}
-
-Rules:
-- Answer each in one compact paragraph.
-- Quote all numbers, dates, time periods, percentages word-for-word.
-- If not found, reply exactly: "Not mentioned in the policy."
-- No lists or numbering.
-
-Answers:"""
-
-WEB_PROMPT_TEMPLATE = """You are a policy assistant. Based on the document title below, answer the questions using public/common knowledge if the exact details are not in the title.
-
-Title:
-{title}
-
-Questions:
-{query}
-
-Rules:
-- One compact paragraph per answer; no bullets / numbering.
-- Quote any numbers / dates you mention.
-- If specific info cannot be inferred from public sources, reply exactly: "Not found in public sources."
-- Do not invent facts.
-
-Answers:"""
-
-def make_question_block(questions: List[str]) -> str:
-    return "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
-
-# ---------------- LLM calls ----------------
-def call_mistral(prompt: str, max_tokens: int = 900, timeout: int = 15) -> str:
-    if not MISTRAL_API_KEY:
-        raise RuntimeError("MISTRAL_API_KEY not set.")
-    url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "mistral-small-latest",
-        "temperature": 0, "top_p": 1,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    r = REQUESTS_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
-
-async def call_groq(prompt: str, max_tokens: int = 900, timeout: int = 20) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY not set.")
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "temperature": 0, "top_p": 1,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    r = await ASYNC_CLIENT.post(url, headers=headers, json=payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
-
-
-def call_mistral_on_chunks(chunks: List[str], question: str) -> str:
-    kchunks = _topk_chunks(question, chunks, k=5) or chunks[:5]
-    context = "\n\n".join(kchunks)
-    lang = "Malayalam" if is_malayalam(question) else "English"
-    prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, query=question, lang=lang)
-    return call_mistral(prompt).strip()
-
-async def call_groq_on_chunks(chunks: List[str], question: str) -> str:
-    kchunks = _topk_chunks(question, chunks, k=5) or chunks[:5]
-    context = "\n\n".join(kchunks)
-    lang = "Malayalam" if is_malayalam(question) else "English"
-    prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, query=question, lang=lang)
-    return (await call_groq(prompt)).strip()
-
-
-
-
-import json
-
-TOKEN_KEYS = ("secret_token", "secretToken", "token", "key", "value", "secret")
-
-def _extract_token_from_json(js):
-    """Depth-first scan for a token-like key in JSON."""
-    if isinstance(js, dict):
-        # direct hit first
-        for k, v in js.items():
-            if k in TOKEN_KEYS and isinstance(v, (str, int)):
-                return str(v)
-        # then recurse
-        for v in js.values():
-            t = _extract_token_from_json(v)
-            if t:
-                return t
-    elif isinstance(js, list):
-        for it in js:
-            t = _extract_token_from_json(it)
-            if t:
-                return t
-    return None
-
-def _extract_token_from_text(text: str):
-    """Heuristics to pull a token from HTML/plain text."""
-    text = text.strip()
-
-    # explicit "token:" syntax
-    m = re.search(r"(?:secret\s*token|token|key)\s*[:=]\s*([A-Za-z0-9._\-]{6,})", text, flags=re.I)
-    if m:
-        return m.group(1)
-
-    # code/pre blocks
-    m = re.search(r"<(?:code|pre)[^>]*>([^<]{6,})</(?:code|pre)>", text, flags=re.I | re.S)
-    if m:
-        return m.group(1).strip()
-
-    # generic long token-like string
-    m = re.search(r"([A-Za-z0-9._\-]{10,})", text)
-    if m:
-        return m.group(1)
-
-    return None
-
-def _handle_mission_url(data: bytes):
-    """
-    Try to extract a secret token from JSON/HTML/text.
-    Return the token string if found; else None.
-    """
-    # JSON first
-    try:
-        js = json.loads(data.decode("utf-8", errors="ignore"))
-        t = _extract_token_from_json(js)
-        if t:
-            return t
-    except Exception:
-        pass
-
-    # HTML/text
-    txt = data.decode("utf-8", errors="ignore")
-    t = _extract_token_from_text(txt)
-    if t:
-        return t
-
-    return None
-
-from urllib.parse import urlparse
-
-def _is_pdf_payload(data: bytes, ctype: str) -> bool:
-    """
-    Detects if the fetched content is a PDF based on content-type header
-    or PDF file signature.
-    """
-    if ctype and "pdf" in ctype.lower():
-        return True
-    # PDF files usually start with '%PDF'
-    return data.startswith(b"%PDF")
-
-def _is_mission_host(url: str) -> bool:
-    """
-    Returns True if the document URL points to the HackRx mission host.
-    """
-    try:
-        host = urlparse(url).netloc.lower()
-    except Exception:
-        return False
-    return "register.hackrx.in" in host
-
-
-# ---------------- Routes ----------------
-
-@app.get("/")
-def health():
-    return {"status": "ok"}
-
-
-
-
-
-@app.post("/api/v1/hackrx/run", response_model=AnswersResp, dependencies=[Depends(require_auth)])
-async def run_analysis(request: RunRequest):
-    """
-    Smart handler:
-    • If the URL is a PDF (by content-type OR magic '%PDF-'): run normal QA pipeline.
-    • If NOT a PDF and host is register.hackrx.in: mission URL → extract/return token.
-    • Otherwise: return a graceful message instead of 400.
-    """
-    start = time.time()
-    try:
-        data, ctype = fetch_url(request.documents)
-
-        # -------- Decide branch --------
-        is_pdf = _is_pdf_payload(data, ctype)   # ✅ This line is fine now
-        is_mission = (not is_pdf) and _is_mission_host(request.documents)  # ✅ No error now
-
-        # -------- Mission URL (non-PDF) --------
-        if is_mission:
-            token = _handle_mission_url(data)
-            if token:
-                return {"answers": [token]}
-            # mission host but token not found → graceful
-            return {"answers": ["Not found in non-PDF URL."]}
-
-        # If it's not a PDF and not mission host, don't hard-fail; be graceful.
-        if not is_pdf:
-            return {"answers": ["Unsupported document type for QA. Only PDFs are accepted."]}
-
-        # -------- PDF branch --------
-        full_text, page_count, title = extract_text_from_pdf_bytes(data, use_ocr=True)
-        if not full_text and page_count == 0:
-            raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
-
-        chunks = split_text_smart(full_text) if full_text else []
-
-        answers: List[str] = []
-
-        # If ANY question is Malayalam, skip the single full-context pass,
-        # and answer per-question to keep language fidelity.
-        any_malayalam = any(is_malayalam(q) for q in request.questions)
-
-        if (page_count <= 100 and full_text and not any_malayalam):
-            try:
-                qblock = make_question_block(request.questions)
-                prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=qblock)
-                resp = call_mistral(prompt)  # primary
-                cleaned = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip()
-                           for ln in resp.splitlines() if ln.strip()]
-                if len(cleaned) >= len(request.questions):
-                    answers = cleaned[:len(request.questions)]
-                else:
-                    answers = [call_mistral_on_chunks(chunks, q) for q in request.questions]
-            except Exception:
-                if GROQ_API_KEY:
-                    answers = [await call_groq_on_chunks(chunks, q) for q in request.questions]
-                else:
-                    answers = [call_mistral_on_chunks(chunks, q) for q in request.questions]
-
-        elif page_count <= 200 or any_malayalam:
-            try:
-                answers = [call_mistral_on_chunks(chunks, q) for q in request.questions]
-            except Exception:
-                answers = [await call_groq_on_chunks(chunks, q) for q in request.questions]
-
-        else:
-            try:
-                qblock = make_question_block(request.questions)
-                prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=qblock)
-                resp = call_mistral(prompt)
-                cleaned = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip()
-                           for ln in resp.splitlines() if ln.strip()]
-                answers = cleaned[:len(request.questions)] if cleaned else ["Not found in public sources."] * len(request.questions)
-            except Exception:
-                answers = ["Not found in public sources."] * len(request.questions)
-
-        return {"answers": answers}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
-    finally:
-        print(f"⏱ Total processing time: {round(time.time() - start, 2)}s")
-
-
-# ---------------- Mission / “ticket” (flight) solver ----------------
-# Map city -> landmark per the PDF tables (extend/fix as needed)
-MISSION_MAP = {
-    # Indian cities — landmark at "Current Location"
-    "Delhi": "Gateway of India",
-    "Mumbai": "India Gate",
-    "Chennai": "Charminar",
-    "Hyderabad": "Taj Mahal",                # Note: "Taj Mahal" is at "Hyderabad"
-    "Pune": "Meenakshi Temple",             # "Meenakshi Temple" → "Pune"
-    "Nagpur": "Lotus Temple",               # "Lotus Temple" → "Nagpur"
-    "Chandigarh": "Mysore Palace",          # "Mysore Palace" → "Chandigarh"
-    "Kerala": "Rock Garden",                # Region "Kerala" → "Rock Garden"
-    "Bhopal": "Victoria Memorial",          # "Victoria Memorial" → "Bhopal"
-    "Varanasi": "Vidhana Soudha",           # "Vidhana Soudha" → "Varanasi"
-    "Jaisalmer": "Sun Temple",              # "Sun Temple" → "Jaisalmer"
-    "Pune2": "Golden Temple",               # "Golden Temple" → "Pune" (entry conflict—use key "Pune2")
-
-    # International cities — landmark at "Current Location"
-    "New York": "Eiffel Tower",
-    "London": "Sydney Opera House",         # Note: "Sydney Opera House" is in "London"
-    "Tokyo": "Big Ben",                     # "Big Ben" → "Tokyo"
-    "Beijing": "Colosseum",                 # "Colosseum" → "Beijing"
-    "Bangkok": "Christ the Redeemer",
-    "Toronto": "Burj Khalifa",
-    "Dubai": "CN Tower",
-    "Amsterdam": "Petronas Towers",
-    "Cairo": "Leaning Tower of Pisa",
-    "San Francisco": "Mount Fuji",
-    "Berlin": "Niagara Falls",
-    "Barcelona": "Louvre Museum",
-    "Moscow": "Stonehenge",
-    "Seoul": "Sagrada Familia",
-    "Cape Town": "Acropolis",
-    "Istanbul": "Big Ben2",                 # Duplicate "Big Ben" mapping—called "Big Ben2"
-}
-
-
-
-def _flight_endpoint_for_landmark(lmk: str) -> str:
-    if lmk == "Gateway of India": return "getFirstCityFlightNumber"
-    if lmk == "Taj Mahal": return "getSecondCityFlightNumber"
-    if lmk == "Eiffel Tower": return "getThirdCityFlightNumber"
-    if lmk == "Big Ben": return "getFourthCityFlightNumber"
-    return "getFifthCityFlightNumber"
-
-
-
-@app.get("/api/v1/hackrx/solve-flight", dependencies=[Depends(require_auth)])
-def solve_flight():
-    city_url = "https://register.hackrx.in/submissions/myFavouriteCity"
-    r = REQUESTS_SESSION.get(city_url, timeout=12)
-    r.raise_for_status()
-    try:
-        payload = r.json()
-        # Expected: {"success":true,"message":"...","status":200,"data":{"city":"New York"}}
-        city = ((payload or {}).get("data") or {}).get("city", "")
-    except Exception:
-        # old fallback if the service ever returns bare text
-        city = (r.text or "").strip().strip('"').strip()
-    if not city:
-        raise HTTPException(status_code=502, detail="Favourite city not returned by upstream.")
-
-    # ---- city -> landmark (fill out the rest of your table as needed)
-    landmark = MISSION_MAP.get(city)
-
-    # If unknown city or ambiguous cases: default to 'Fifth' (problem spec: all others)
-    route = "getFifthCityFlightNumber"
-    if landmark == "Gateway of India":
-        route = "getFirstCityFlightNumber"
-    elif landmark == "Taj Mahal":
-        route = "getSecondCityFlightNumber"
-    elif landmark == "Eiffel Tower":
-        route = "getThirdCityFlightNumber"
-    elif landmark == "Big Ben":
-        route = "getFourthCityFlightNumber"
-
-    flight_url = f"https://register.hackrx.in/teams/public/flights/{route}"
-    r2 = REQUESTS_SESSION.get(flight_url, timeout=12, headers={"Accept": "application/json"})
-    r2.raise_for_status()
-
-    # Expected: {"success":true,"message":"...","status":200,"data":{"flightNumber":"8ada3c"}}
-    try:
-        f = r2.json()
-        flight_num = ((f or {}).get("data") or {}).get("flightNumber", "")
-        if not flight_num:
-            # fallback for rare plain-text responses
-            flight_num = (r2.text or "").strip().strip('"').strip()
-    except Exception:
-        flight_num = (r2.text or "").strip().strip('"').strip()
-
-    if not flight_num:
-        raise HTTPException(status_code=502, detail="Flight number missing from upstream response.")
-
-    return {
-        "city": city,
-        "landmark": landmark or "Unknown (defaulted to Fifth route)",
-        "route_used": route,
-        "flight_number": flight_num
-    }
-
-
-
-
-
-# ---------------- Debug: inspect retrieval ----------------
-@app.post("/api/v1/hackrx/debug/topk", dependencies=[Depends(require_auth)])
-def debug_topk(request: RunRequest):
-    data, ctype = fetch_url(request.documents)
-    if "pdf" not in ctype:
-        raise HTTPException(status_code=400, detail=f"Unsupported content type: {ctype}. Only PDFs are accepted.")
-    full_text, _, _ = extract_text_from_pdf_bytes(data)
-    chunks = split_text_smart(full_text)
-    out = {}
-    for q in request.questions:
-        out[q] = _topk_chunks(q, chunks, k=5)
-    return out
-
+# # main.py — PDF QA API (Level-4 route added)
+# # Run: uvicorn main:app --host 0.0.0.0 --port 8000
+# # Env: API_TOKEN (required), MISTRAL_API_KEY (optional), GROQ_API_KEY (optional)
+# # NOTE: No extra deps beyond your current stack; prompts / models unchanged.
+
+# from fastapi import FastAPI, HTTPException, Header
+# from pydantic import BaseModel
+# from typing import List, Tuple, Optional
+# import os, tempfile, io, time, re
+# import fitz  # PyMuPDF
+# from PIL import Image
+# import pytesseract
+# import requests, httpx
+# import asyncio
+# from dotenv import load_dotenv
+
+# # ---------------- App & Clients ----------------
+# app = FastAPI()
+
+# import urllib3
+# from requests.adapters import HTTPAdapter
+# from urllib3.util.retry import Retry
+
+# REQUESTS_SESSION = requests.Session()
+# REQUESTS_SESSION.headers.update({"Accept-Encoding": "gzip, deflate"})
+# REQUESTS_SESSION.mount(
+#     "https://",
+#     HTTPAdapter(
+#         pool_connections=20, pool_maxsize=20,
+#         max_retries=Retry(total=2, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])
+#     ),
+# )
+
+# ASYNC_CLIENT = httpx.AsyncClient(
+#     http2=True,
+#     timeout=20.0,  # SUGGESTION: drop to 12–15s if you need stricter SLA
+#     headers={"Accept-Encoding": "gzip, deflate"},
+#     limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+# )
+
+# @app.on_event("shutdown")
+# async def shutdown_event():
+#     await ASYNC_CLIENT.aclose()
+
+# load_dotenv()
+
+# MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+# GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
+# API_TOKEN       = os.getenv("API_TOKEN")
+# if not API_TOKEN:
+#     raise RuntimeError("API_TOKEN must be set")
+
+# # ---------------- Schemas ----------------
+# class RunRequest(BaseModel):
+#     documents: str
+#     questions: List[str]
+
+# # ---------------- Prompts ----------------
+# FULL_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the information provided in the context to answer the questions.
+# Context:
+# {context}
+
+# Questions:
+# {query}
+
+# Instructions:
+# 1. Provide clear and direct answers based ONLY on the context.
+# 2. Do not specify the clause number or clause description.
+# 3. If the answer is "Yes" or "No," include a short explanation.
+# 4. If not found in the context, reply: "Not mentioned in the policy."
+# 5. Give each answer in a single paragraph without numbering.
+
+# Answers:"""
+
+# CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context>. If and only if the policy lacks the answer, you may use <WebSnippets>.
+
+# Decision rule:
+# 1) Search ALL of <Context>. If the answer exists there, answer ONLY from <Context>.
+# 2) If the answer is NOT in <Context>, search <WebSnippets>. If found there, answer from <WebSnippets> and keep it concise.
+# 3) If the answer is in neither source, reply exactly: "Not mentioned in the policy."
+
+# Requirements:
+# - Quote every number, amount, time period, percentage, sub-limit, definition, eligibility, exclusion, waiting period, and condition **word-for-word**.
+# - If Yes/No, start with “Yes.” or “No.” and immediately quote the rule that makes it so.
+# - Include all applicable conditions in a compact way.
+# - No clause numbers, no speculation, no invented facts.
+
+# Context:
+# {context}
+
+# WebSnippets:
+# {web_snippets}
+
+# Questions:
+# {query}
+
+# Answers (one concise paragraph per question, no bullets, no numbering):
+# """
+
+# WEB_PROMPT_TEMPLATE = """You are an expert insurance policy assistant. Based on the document titled "{title}", answer the following questions using general or public insurance knowledge.
+# Title: "{title}"
+
+# Questions:
+# {query}
+
+# Instructions:
+# - Use public knowledge.
+# - If specific document data is needed, reply: "Not found in public sources."
+# - Keep each answer concise (1 paragraph max).
+# - Give each answer in a single paragraph without numbering.
+
+# Answers:"""
+
+# # ---------------- Helpers ----------------
+# def approx_tokens_from_text(s: str) -> int:
+#     # crude estimate: ~4 chars/token
+#     return max(1, len(s) // 4)
+
+# def choose_mistral_params(page_count: int, context_text: Optional[str]):
+#     # NOTE: keep your budget logic intact
+#     ctx_tok = approx_tokens_from_text(context_text or "")
+#     if page_count <= 100:
+#         max_tokens, temperature, timeout = 1100, 0.20, 15
+#     elif page_count <= 200:
+#         max_tokens, temperature, timeout = 1400, 0.22, 15
+#     else:
+#         max_tokens, temperature, timeout = 800, 0.18, 12
+#     total_budget = 3500
+#     budget_left = max(600, total_budget - ctx_tok)
+#     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
+
+# def choose_groq_params(page_count: int, context_text: Optional[str]):
+#     ctx_tok = approx_tokens_from_text(context_text or "")
+#     if page_count <= 100:
+#         max_tokens, temperature, timeout = 1300, 0.2, 30
+#     elif page_count <= 200:
+#         max_tokens, temperature, timeout = 1700, 0.2, 30
+#     else:
+#         max_tokens, temperature, timeout = 1100, 0.13, 25
+#     total_budget = 3500
+#     budget_left = max(800, total_budget - ctx_tok)
+#     return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
+
+# def make_question_block(questions: List[str]) -> str:
+#     return "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+
+# # ---------------- PDF Extraction ----------------
+# def extract_text_from_pdf_url(pdf_url: str) -> Tuple[str, int, str]:
+#     r = REQUESTS_SESSION.get(pdf_url, timeout=20)
+#     r.raise_for_status()
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+#         tmp.write(r.content)
+#         tmp_path = tmp.name
+
+#     full_text, title = "", ""
+#     with fitz.open(tmp_path) as doc:
+#         page_count = len(doc)
+
+#         # Title: quick try from first few pages; OCR fallback
+#         for i in range(min(15, page_count)):
+#             t = (doc[i].get_text() or "").strip()
+#             if not t:
+#                 try:
+#                     # SUGGESTION: dpi=120 is often enough; 100 keeps it fast
+#                     pix = doc[i].get_pixmap(dpi=100)
+#                     img = Image.open(io.BytesIO(pix.tobytes("png")))
+#                     t = pytesseract.image_to_string(img, lang="eng").strip()
+#                 except Exception:
+#                     continue
+#             if t:
+#                 title = t.splitlines()[0][:100]
+#                 break
+
+#         # Full text (<=200 pages)
+#         if page_count <= 200:
+#             for i in range(page_count):
+#                 t = (doc[i].get_text() or "").strip()
+#                 if not t:
+#                     try:
+#                         pix = doc[i].get_pixmap(dpi=100)
+#                         img = Image.open(io.BytesIO(pix.tobytes("png")))
+#                         t = pytesseract.image_to_string(img, lang="eng").strip()
+#                     except Exception:
+#                         t = ""
+#                 if t:
+#                     full_text += t + "\n"
+
+#     os.remove(tmp_path)
+#     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
+
+# def split_text(text: str, chunk_size: int = 1200, overlap: int = 150) -> List[str]:
+#     """
+#     SUGGESTION:
+#       - If latency is high, try chunk_size=1500 and overlap=100 (fewer calls).
+#       - If accuracy needs a bit more, try overlap=200–250.
+#     """
+#     chunks, start = [], 0
+#     n = len(text)
+#     # SUGGESTION: cap chunks to ~15 for latency; your code already does that
+#     while start < n and len(chunks) < 15:
+#         chunks.append(text[start:start + chunk_size])
+#         start += chunk_size - overlap
+#     return chunks
+
+# # ---------------- LLM Calls ----------------
+# def call_mistral(prompt: str, params: dict) -> str:
+#     url = "https://api.mistral.ai/v1/chat/completions"
+#     headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+#     payload = {
+#         "model": "mistral-small-latest",
+#         "temperature": params.get("temperature", 0.3),
+#         "top_p": 1,
+#         "max_tokens": params.get("max_tokens", 1000),
+#         "messages": [{"role": "user", "content": prompt}],
+#     }
+#     r = REQUESTS_SESSION.post(url, headers=headers, json=payload, timeout=params.get("timeout", 15))
+#     r.raise_for_status()
+#     return r.json()["choices"][0]["message"]["content"]
+
+# def _score_chunk(q: str, c: str) -> int:
+#     # NOTE: simple lexical+number overlap; kept your logic to avoid extra deps.
+#     WORD_RX = re.compile(r"\w+")
+#     NUM_RX  = re.compile(r"\d+%?")
+#     qt = set(WORD_RX.findall(q.lower()))
+#     ct = set(WORD_RX.findall(c.lower()))
+#     base = len(qt & ct)
+#     num_bonus = 2 * len(set(NUM_RX.findall(q)) & set(NUM_RX.findall(c)))
+#     return base + num_bonus
+
+# def _topk_chunks(q: str, chunks: List[str], k: int = 4) -> List[str]:
+#     scored = sorted((( _score_chunk(q, c), c) for c in chunks), key=lambda x: x[0], reverse=True)
+#     return [c for _, c in scored[:k]] if scored else []
+
+# KEY_LINE_RX = re.compile(
+#     r'(\b\d+\s*(day|days|month|months|year|years|%)\b|sub-?limit|room rent|ICU|AYUSH|grace|waiting|'
+#     r'deductible|co-?pay|exclusion|PED|check[-\s]?up|sum insured|premium|pre[-\s]?auth|pre[-\s]?existing)',
+#     re.I
+# )
+
+# def _harvest_numeric_lines(text: str, max_lines: int = 60) -> str:
+#     # NOTE: helps the model quote numbers verbatim
+#     seen, out = set(), []
+#     for ln in (l.strip() for l in text.splitlines() if l.strip()):
+#         if KEY_LINE_RX.search(ln) and ln not in seen:
+#             seen.add(ln); out.append(ln)
+#             if len(out) >= max_lines: break
+#     return "\n".join(out)
+
+# def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
+#     answers = []
+#     for q in questions:
+#         kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
+#         combined = "\n\n".join(kchunks)
+#         evidence = _harvest_numeric_lines(combined)
+#         context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
+#         prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
+#         ans = call_mistral(prompt, params).strip()
+#         answers.append(ans)
+#     return answers
+
+# async def call_groq_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
+#     # single-batch (one prompt per question) using top-k chunks too
+#     answers = []
+#     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+#     url = "https://api.groq.com/openai/v1/chat/completions"
+
+#     async def ask(q: str):
+#         kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
+#         combined = "\n\n".join(kchunks)
+#         evidence = _harvest_numeric_lines(combined)
+#         context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
+#         prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
+#         payload = {
+#             "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+#             "temperature": params.get("temperature", 0.3),
+#             "top_p": 1,
+#             "max_tokens": params.get("max_tokens", 1000),
+#             "messages": [{"role": "user", "content": prompt}],
+#         }
+#         r = await ASYNC_CLIENT.post(url, headers=headers, json=payload, timeout=params.get("timeout", 20))
+#         r.raise_for_status()
+#         return r.json()["choices"][0]["message"]["content"].strip()
+
+#     results = await asyncio.gather(*[ask(q) for q in questions])
+#     answers.extend(results)
+#     return answers
+
+# # ---------------- Level-4 helpers (added) ----------------
+# _NOT_FOUND_RX = re.compile(r"^\s*not\s+mentioned\s+in\s+the\s+policy\.?\s*$", re.I)
+
+# def _sanitize_line(s: str) -> str:
+#     s = (s or "").strip()
+#     s = re.sub(r"^\d+[\.\)]\s*", "", s)
+#     s = re.sub(r"^Answer\s*:\s*", "", s, flags=re.I)
+#     return s.strip()
+
+# def _is_not_found(s: str) -> bool:
+#     return bool(_NOT_FOUND_RX.match((s or "").strip()))
+
+# def _topk_indices(q: str, chunks: List[str], k: int = 5) -> List[int]:
+#     # SUGGESTION: for slightly better recall, set k=6 when latency allows
+#     scored = sorted(((i, _score_chunk(q, c)) for i, c in enumerate(chunks)), key=lambda x: x[1], reverse=True)
+#     return [i for i, _ in scored[:k]]
+
+# def _context_with_neighbors(chunks: List[str], idxs: List[int], neighbor: int = 1, budget_chars: int = 9000) -> str:
+#     # collect top matches with ±neighbor chunks, respecting a char budget
+#     want = set()
+#     for i in idxs:
+#         for j in range(max(0, i - neighbor), min(len(chunks), i + neighbor + 1)):
+#             want.add(j)
+#     ordered = sorted(want)
+#     buf, used = [], 0
+#     for j in ordered:
+#         seg = chunks[j].strip()
+#         if not seg:
+#             continue
+#         if used + len(seg) + 2 > budget_chars:
+#             break
+#         buf.append(seg)
+#         used += len(seg) + 2
+#     # numeric/limit lines to help the model quote exact numbers
+#     evidence = _harvest_numeric_lines("\n\n".join(buf), max_lines=120)
+#     if evidence:
+#         buf.append("\n--- Evidence ---\n" + evidence)
+#     return "\n\n".join(buf)
+
+# async def _retry_per_question(q: str, full_text: str, chunks: List[str], page_count: int) -> str:
+#     """
+#     Focused retry for weak/blank answers:
+#       1) Mistral with top-k + neighbors context
+#       2) Groq fallback with same idea
+#     """
+#     # Mistral retry
+#     try:
+#         idxs = _topk_indices(q, chunks, k=6)
+#         ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
+#         m_params = choose_mistral_params(page_count, ctx)
+#         a = _sanitize_line(call_mistral(
+#             CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q),
+#             m_params
+#         ))
+#         if a and not _is_not_found(a):
+#             return a
+#     except Exception:
+#         pass
+#     # Groq fallback
+#     try:
+#         g_params = choose_groq_params(page_count, "\n".join(chunks[:10]))
+#         kchunks = _topk_chunks(q, chunks, k=6) or chunks[:4]
+#         combined = "\n\n".join(kchunks)
+#         evidence = _harvest_numeric_lines(combined)
+#         ctx2 = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
+#         outs = await call_groq_on_chunks([ctx2], [q], g_params)
+#         a2 = _sanitize_line((outs[0] if outs else "") or "")
+#         if a2:
+#             return a2
+#     except Exception:
+#         pass
+#     return "Not mentioned in the policy."
+
+
+# import json
+# from urllib.parse import urlparse
+
+# # --- detect PDF vs mission URL ---
+# def _is_pdf_payload(data: bytes, ctype: str) -> bool:
+#     return (ctype and "pdf" in ctype.lower()) or data.startswith(b"%PDF")
+
+# def _is_mission_host(url: str) -> bool:
+#     try:
+#         return "register.hackrx.in" in urlparse(url).netloc.lower()
+#     except Exception:
+#         return False
+
+# # --- secret token extraction ---
+# TOKEN_KEYS = ("secret_token", "secretToken", "token", "key", "value", "secret")
+
+# def _extract_token_from_json(js):
+#     if isinstance(js, dict):
+#         for k, v in js.items():
+#             if k in TOKEN_KEYS and isinstance(v, (str, int)):
+#                 return str(v)
+#         for v in js.values():
+#             t = _extract_token_from_json(v)
+#             if t: return t
+#     elif isinstance(js, list):
+#         for it in js:
+#             t = _extract_token_from_json(it)
+#             if t: return t
+#     return None
+
+# def _extract_token_from_text(text: str):
+#     text = text.strip()
+#     m = re.search(r"(?:secret\s*token|token|key)\s*[:=]\s*([A-Za-z0-9._\-]{6,})", text, flags=re.I)
+#     if m: return m.group(1)
+#     m = re.search(r"<(?:code|pre)[^>]*>([^<]{6,})</(?:code|pre)>", text, flags=re.I|re.S)
+#     if m: return m.group(1).strip()
+#     m = re.search(r"([A-Za-z0-9._\-]{10,})", text)
+#     if m: return m.group(1)
+#     return None
+
+# def _handle_mission_url(data: bytes):
+#     # try JSON
+#     try:
+#         js = json.loads(data.decode("utf-8", errors="ignore"))
+#         t = _extract_token_from_json(js)
+#         if t: return t
+#     except Exception:
+#         pass
+#     # fallback HTML/text
+#     return _extract_token_from_text(data.decode("utf-8", errors="ignore"))
+
+# # --- city -> landmark mapping from your Mission Brief PDF ---
+# MISSION_MAP = {
+#     # Indian cities
+#     "Delhi": "Gateway of India",
+#     "Mumbai": "India Gate",
+#     "Chennai": "Charminar",
+#     "Hyderabad": "Marina Beach",  # page1 table
+#     "Ahmedabad": "Howrah Bridge",
+#     "Mysuru": "Golconda Fort",
+#     "Kochi": "Qutub Minar",
+#     "Hyderabad": "Taj Mahal",      # page2 table overrides; PDF has multiple tables
+#     "Pune": "Meenakshi Temple",    # also "Golden Temple" later; we’ll treat non-first as “other”
+#     "Nagpur": "Lotus Temple",
+#     "Chandigarh": "Mysore Palace",
+#     "Kerala": "Rock Garden",
+#     "Bhopal": "Victoria Memorial",
+#     "Varanasi": "Vidhana Soudha",
+#     "Jaisalmer": "Sun Temple",
+
+#     # International
+#     "New York": "Eiffel Tower",
+#     "London": "Statue of Liberty",  # also “Sydney Opera House” appears in London table
+#     "Tokyo": "Big Ben",
+#     "Beijing": "Colosseum",
+#     "Bangkok": "Christ the Redeemer",
+#     "Toronto": "Burj Khalifa",
+#     "Dubai": "CN Tower",
+#     "Amsterdam": "Petronas Towers",
+#     "Cairo": "Leaning Tower of Pisa",
+#     "San Francisco": "Mount Fuji",
+#     "Berlin": "Niagara Falls",
+#     "Barcelona": "Louvre Museum",
+#     "Moscow": "Stonehenge",
+#     "Seoul": "Sagrada Familia",
+#     "Cape Town": "Acropolis",
+#     "Istanbul": "Big Ben",
+#     # Page 3 extra examples omitted (not required for the 5-route logic)
+# }
+
+# def _flight_endpoint_for_landmark(lmk: str) -> str:
+#     # 1) Gateway of India -> First
+#     if lmk == "Gateway of India":
+#         return "getFirstCityFlightNumber"
+#     # 2) Taj Mahal -> Second
+#     if lmk == "Taj Mahal":
+#         return "getSecondCityFlightNumber"
+#     # 3) Eiffel Tower -> Third
+#     if lmk == "Eiffel Tower":
+#         return "getThirdCityFlightNumber"
+#     # 4) Big Ben -> Fourth
+#     if lmk == "Big Ben":
+#         return "getFourthCityFlightNumber"
+#     # 5) Everything else -> Fifth
+#     return "getFifthCityFlightNumber"
+
+# def _solve_flight_number() -> str:
+#     # Step 1: get favourite city
+#     city_url = "https://register.hackrx.in/submissions/myFavouriteCity"
+#     r1 = REQUESTS_SESSION.get(city_url, timeout=12, headers={"Accept": "application/json"})
+#     r1.raise_for_status()
+#     try:
+#         city = ((r1.json() or {}).get("data") or {}).get("city", "")
+#     except Exception:
+#         city = (r1.text or "").strip().strip('"').strip()
+#     if not city:
+#         raise RuntimeError("Favourite city not returned")
+
+#     # Step 2/3: map to landmark, choose route
+#     lmk = MISSION_MAP.get(city, "")
+#     route = _flight_endpoint_for_landmark(lmk)
+
+#     # Step 4: get flight number
+#     f_url = f"https://register.hackrx.in/teams/public/flights/{route}"
+#     r2 = REQUESTS_SESSION.get(f_url, timeout=12, headers={"Accept": "application/json"})
+#     r2.raise_for_status()
+#     try:
+#         flight = ((r2.json() or {}).get("data") or {}).get("flightNumber", "")
+#         if not flight:
+#             flight = (r2.text or "").strip().strip('"').strip()
+#     except Exception:
+#         flight = (r2.text or "").strip().strip('"').strip()
+#     if not flight:
+#         raise RuntimeError("Flight number missing")
+#     return flight
+
+
+
+
+
+# # ---------------- Routes ----------------
+# @app.get("/")
+# def read_root():
+#     return {"message": "PDF API is running"}
+
+# # Original route (unchanged behavior)
+
+
+# @app.post("/api/v1/hackrx/run")
+# async def run_analysis_final(request: RunRequest, authorization: str = Header(...)):
+#     """
+#     Final Level-4 route merged into /api/v1/hackrx/run:
+#     - Handles non-PDF register.hackrx.in URLs (secret token / flight number).
+#     - ≤100 pages: full-context first; auto-recheck any weak/blank answers with focused top-k+neighbors.
+#     - 101–200 pages: per-question focused context; targeted retries.
+#     - >200 pages: title/public path.
+#     """
+#     if authorization != f"Bearer {API_TOKEN}":
+#         raise HTTPException(status_code=401, detail="Unauthorized")
+
+#     start = time.time()
+#     try:
+#         # Fetch once
+#         r = REQUESTS_SESSION.get(request.documents, timeout=20)
+#         r.raise_for_status()
+#         data = r.content
+#         ctype = (r.headers.get("Content-Type") or "").split(";")[0].lower().strip()
+
+#         # Detect PDF vs mission URL
+#         is_pdf = _is_pdf_payload(data, ctype)
+#         if not is_pdf and _is_mission_host(request.documents):
+#             # a) secret token endpoints
+#             token = _handle_mission_url(data)
+#             if token:
+#                 return {"answers": [token]}
+#             # b) flight number solver
+#             if "flight number" in " ".join(request.questions).lower():
+#                 try:
+#                     flight = _solve_flight_number()
+#                     return {"answers": [flight]}
+#                 except Exception as e:
+#                     raise HTTPException(status_code=502, detail=f"Flight solver failed: {e}")
+#             return {"answers": ["Not found in non-PDF URL."]}
+
+#         # Quick PDF meta
+#         page_count_fast, title_fast = 0, "Untitled Document"
+#         try:
+#             with fitz.open(stream=data, filetype="pdf") as doc:
+#                 page_count_fast = len(doc)
+#                 first = (doc[0].get_text("text", sort=True) or "").strip() if len(doc) else ""
+#                 if first:
+#                     title_fast = first.splitlines()[0][:120]
+#         except Exception:
+#             pass
+
+#         # >200 pages → title/public info path
+#         if page_count_fast and page_count_fast > 200:
+#             try:
+#                 qblock = make_question_block(request.questions)
+#                 m_params = choose_mistral_params(page_count_fast, title_fast)
+#                 resp = call_mistral(WEB_PROMPT_TEMPLATE.format(title=title_fast, query=qblock), m_params)
+#                 cleaned = [_sanitize_line(ln) for ln in resp.splitlines() if ln.strip()]
+#                 answers = cleaned[:len(request.questions)] if cleaned else ["Not found in public sources."] * len(request.questions)
+#                 return {"answers": answers}
+#             except Exception:
+#                 return {"answers": ["Not found in public sources."] * len(request.questions)}
+
+#         # ≤200: Extract full text
+#         full_text, page_count, _title = extract_text_from_pdf_url(request.documents)
+#         chunks = split_text(full_text) if full_text else []
+#         if not full_text:
+#             raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
+
+#         # ≤100 pages: full context first, retry blanks
+#         if page_count <= 100:
+#             answers: List[str] = []
+#             try:
+#                 m_params = choose_mistral_params(page_count, full_text)
+#                 resp = call_mistral(
+#                     FULL_PROMPT_TEMPLATE.format(context=full_text, query=make_question_block(request.questions)),
+#                     m_params
+#                 )
+#                 answers = [_sanitize_line(a) for a in resp.split("\n") if a.strip()]
+#             except Exception:
+#                 answers = []
+
+#             while len(answers) < len(request.questions):
+#                 answers.append("")
+
+#             for i, q in enumerate(request.questions):
+#                 if not answers[i] or _is_not_found(answers[i]):
+#                     answers[i] = await _retry_per_question(q, full_text, chunks, page_count)
+
+#             return {"answers": answers[:len(request.questions)]}
+
+#         # 101–200 pages: per-question focus + retry
+#         elif page_count <= 200:
+#             out: List[str] = []
+#             for q in request.questions:
+#                 try:
+#                     idxs = _topk_indices(q, chunks, k=6)  # reduce k for speed
+#                     ctx = _context_with_neighbors(chunks, idxs, neighbor=1, budget_chars=9500)
+#                     m_params = choose_mistral_params(page_count, ctx)
+#                     a = _sanitize_line(
+#                         call_mistral(CHUNK_PROMPT_TEMPLATE.format(context=ctx, web_snippets="", query=q), m_params)
+#                     )
+#                     if not a or _is_not_found(a):
+#                         a = await _retry_per_question(q, full_text, chunks, page_count)
+#                     out.append(a)
+#                 except Exception:
+#                     out.append(await _retry_per_question(q, full_text, chunks, page_count))
+#             return {"answers": out}
+
+#         return {"answers": ["Not found in public sources."] * len(request.questions)}
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+#     finally:
+#         print(f"⏱ Final total time: {round(time.time() - start, 2)}s")
