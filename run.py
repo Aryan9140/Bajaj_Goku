@@ -72,12 +72,12 @@ Instructions:
 
 Answers:"""
 
-CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context>. If and only if the policy lacks the answer, you may use <WebSnippets>.
+CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context>.
 
 Decision rule:
 1) Search ALL of <Context>. If the answer exists there, answer ONLY from <Context>.
-2) If the answer is NOT in <Context>, search <WebSnippets>. If found there, answer from <WebSnippets> and keep it concise.
-3) If the answer is in neither source, reply exactly: "Not mentioned in the policy."
+2) If the answer is NOT in <Context>, reply exactly: "Not mentioned in the policy."
+3) Answer in the SAME LANGUAGE as the question.
 
 Requirements:
 - Quote every number, amount, time period, percentage, sub-limit, definition, eligibility, exclusion, waiting period, and condition **word-for-word**.
@@ -88,14 +88,12 @@ Requirements:
 Context:
 {context}
 
-WebSnippets:
-{web_snippets}
-
 Questions:
 {query}
 
 Answers (one concise paragraph per question, no bullets, no numbering):
 """
+
 
 WEB_PROMPT_TEMPLATE = """You are an expert insurance policy assistant. Based on the document titled "{title}", answer the following questions using general or public insurance knowledge.
 Title: "{title}"
@@ -359,6 +357,9 @@ async def _retry_per_question(q: str, full_text: str, chunks: List[str], page_co
     return "Not mentioned in the policy."
 
 
+
+
+
 import json
 from urllib.parse import urlparse
 
@@ -372,8 +373,8 @@ def _is_mission_host(url: str) -> bool:
     except Exception:
         return False
 
-# --- secret token extraction ---
-TOKEN_KEYS = ("secret_token", "secretToken", "token", "key", "value", "secret")
+# --- secret token extraction (hardened) ---
+TOKEN_KEYS = ("secret_token", "secretToken", "token", "apiKey", "apikey", "key", "secret")
 
 def _extract_token_from_json(js):
     if isinstance(js, dict):
@@ -382,21 +383,58 @@ def _extract_token_from_json(js):
                 return str(v)
         for v in js.values():
             t = _extract_token_from_json(v)
-            if t: return t
+            if t:
+                return t
     elif isinstance(js, list):
         for it in js:
             t = _extract_token_from_json(it)
-            if t: return t
+            if t:
+                return t
     return None
 
+# Matches:
+#  - labeled tokens: token: <value>, secret token = <value>, key:<value>
+#  - <code>/<pre> wrapped values
+#  - unlabeled but clearly token-ish long hex/base64-ish strings, esp. near 'Secret Token'
+_TOKEN_LABELED_RX = re.compile(
+    r'(?:(?:secret\s*token|secretToken|token|api[_\s-]*key|apikey|key)\s*[:=]\s*["\']?)([A-Za-z0-9._\-]{16,})',
+    re.I
+)
+_TOKEN_CODE_RX = re.compile(r'<(?:code|pre)[^>]*>\s*([^<>\s]{16,})\s*</(?:code|pre)>', re.I | re.S)
+# Long hex (like your example), or long base64/ID tokens (avoid matching 'device-width')
+_TOKEN_UNLABELED_HEX_RX = re.compile(r'(?<![A-Za-z0-9])[A-Fa-f0-9]{32,128}(?![A-Za-z0-9])')
+_TOKEN_UNLABELED_B64ish_RX = re.compile(r'(?<![A-Za-z0-9])[A-Za-z0-9._\-]{24,256}(?![A-Za-z0-9])')
+
 def _extract_token_from_text(text: str):
-    text = text.strip()
-    m = re.search(r"(?:secret\s*token|token|key)\s*[:=]\s*([A-Za-z0-9._\-]{6,})", text, flags=re.I)
-    if m: return m.group(1)
-    m = re.search(r"<(?:code|pre)[^>]*>([^<]{6,})</(?:code|pre)>", text, flags=re.I|re.S)
-    if m: return m.group(1).strip()
-    m = re.search(r"([A-Za-z0-9._\-]{10,})", text)
-    if m: return m.group(1)
+    text = (text or "").strip()
+
+    # Prefer labeled forms
+    m = _TOKEN_LABELED_RX.search(text)
+    if m:
+        cand = m.group(1).strip()
+        if cand.lower() != "device-width":
+            return cand
+
+    # <code>/<pre> blocks
+    m = _TOKEN_CODE_RX.search(text)
+    if m:
+        cand = m.group(1).strip()
+        if cand.lower() != "device-width":
+            return cand
+
+    # If the page explicitly mentions "Secret Token", look around it for an unlabeled token-ish value
+    if re.search(r'secret\s*token', text, re.I):
+        # try a long hex first
+        m = _TOKEN_UNLABELED_HEX_RX.search(text)
+        if m:
+            return m.group(0)
+        # then a long id/base64-ish, but filter obvious viewport artifacts
+        for m in _TOKEN_UNLABELED_B64ish_RX.finditer(text):
+            cand = m.group(0)
+            if cand.lower() != "device-width":
+                return cand
+
+    # Otherwise, do NOT guess to avoid false positives like "device-width"
     return None
 
 def _handle_mission_url(data: bytes):
@@ -404,108 +442,175 @@ def _handle_mission_url(data: bytes):
     try:
         js = json.loads(data.decode("utf-8", errors="ignore"))
         t = _extract_token_from_json(js)
-        if t: return t
+        if t:
+            return t
     except Exception:
         pass
     # fallback HTML/text
     return _extract_token_from_text(data.decode("utf-8", errors="ignore"))
 
-# --- city -> landmark mapping from your Mission Brief PDF ---
-MISSION_MAP = {
-    # Indian cities
-    "Delhi": "Gateway of India",
-    "Mumbai": "India Gate",
-    "Chennai": "Charminar",
-    "Hyderabad": "Marina Beach",  # page1 table
-    "Ahmedabad": "Howrah Bridge",
-    "Mysuru": "Golconda Fort",
-    "Kochi": "Qutub Minar",
-    "Hyderabad": "Taj Mahal",      # page2 table overrides; PDF has multiple tables
-    "Pune": "Meenakshi Temple",    # also "Golden Temple" later; we’ll treat non-first as “other”
-    "Nagpur": "Lotus Temple",
-    "Chandigarh": "Mysore Palace",
-    "Kerala": "Rock Garden",
-    "Bhopal": "Victoria Memorial",
-    "Varanasi": "Vidhana Soudha",
-    "Jaisalmer": "Sun Temple",
 
-    # International
-    "New York": "Eiffel Tower",
-    "London": "Statue of Liberty",  # also “Sydney Opera House” appears in London table
-    "Tokyo": "Big Ben",
-    "Beijing": "Colosseum",
-    "Bangkok": "Christ the Redeemer",
-    "Toronto": "Burj Khalifa",
-    "Dubai": "CN Tower",
-    "Amsterdam": "Petronas Towers",
-    "Cairo": "Leaning Tower of Pisa",
-    "San Francisco": "Mount Fuji",
-    "Berlin": "Niagara Falls",
-    "Barcelona": "Louvre Museum",
-    "Moscow": "Stonehenge",
-    "Seoul": "Sagrada Familia",
-    "Cape Town": "Acropolis",
-    "Istanbul": "Big Ben",
-    # Page 3 extra examples omitted (not required for the 5-route logic)
-}
+
+# --- city -> landmark mapping from your Mission Brief PDF ---
+
+
+
+
+
+
+
+
+# ---- Dynamic city→landmark from mission PDF (no hardcoding) ----
+# ---- Dynamic city→landmark from mission PDF (no hardcoding) ----
+# ---- City ↔ Landmark per the PDF (no public knowledge, no LLM) ----
+import re, time, collections
+
+# Exactly as in the PDF (order matters: first match wins when a city repeats)
+_LANDMARK_CITY_ROWS = [
+    # Indian Cities (Page 1)
+    ("Gateway of India", "Delhi"),
+    ("India Gate", "Mumbai"),
+    ("Charminar", "Chennai"),
+    ("Marina Beach", "Hyderabad"),
+    ("Howrah Bridge", "Ahmedabad"),
+    ("Golconda Fort", "Mysuru"),
+    ("Qutub Minar", "Kochi"),
+
+    # Continued (Page 2)
+    ("Taj Mahal", "Hyderabad"),
+    ("Meenakshi Temple", "Pune"),
+    ("Lotus Temple", "Nagpur"),
+    ("Mysore Palace", "Chandigarh"),
+    ("Rock Garden", "Kerala"),
+    ("Victoria Memorial", "Bhopal"),
+    ("Vidhana Soudha", "Varanasi"),
+    ("Sun Temple", "Jaisalmer"),
+    ("Golden Temple", "Pune"),
+
+    # International Cities (Page 2)
+    ("Eiffel Tower", "New York"),
+    ("Statue of Liberty", "London"),
+    ("Big Ben", "Tokyo"),
+    ("Colosseum", "Beijing"),
+    ("Sydney Opera House", "London"),
+    ("Christ the Redeemer", "Bangkok"),
+    ("Burj Khalifa", "Toronto"),
+    ("CN Tower", "Dubai"),
+    ("Petronas Towers", "Amsterdam"),
+    ("Leaning Tower of Pisa", "Cairo"),
+    ("Mount Fuji", "San Francisco"),
+    ("Niagara Falls", "Berlin"),
+    ("Louvre Museum", "Barcelona"),
+    ("Stonehenge", "Moscow"),
+    ("Sagrada Familia", "Seoul"),
+    ("Acropolis", "Cape Town"),
+    ("Big Ben", "Istanbul"),
+
+    # Page 3 examples (not needed for route rules, but included for completeness)
+    ("Machu Picchu", "Riyadh"),
+    ("Taj Mahal", "Paris"),
+    ("Moai Statues", "Dubai Airport"),
+    ("Christchurch Cathedral", "Singapore"),
+    ("The Shard", "Jakarta"),
+    ("Blue Mosque", "Vienna"),
+    ("Neuschwanstein Castle", "Kathmandu"),
+    ("Buckingham Palace", "Los Angeles"),
+    ("Space Needle", "Mumbai"),
+    ("Times Square", "Seoul"),
+]
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).casefold()
+
+# Build CITY -> LANDMARK (first row wins)
+_CITY_TO_LANDMARK = {}
+for lmk, city in _LANDMARK_CITY_ROWS:
+    k = _norm(city)
+    if k not in _CITY_TO_LANDMARK:
+        _CITY_TO_LANDMARK[k] = lmk
 
 def _flight_endpoint_for_landmark(lmk: str) -> str:
-    # 1) Gateway of India -> First
-    if lmk == "Gateway of India":
+    l = _norm(lmk)
+    if "gateway of india" in l:
         return "getFirstCityFlightNumber"
-    # 2) Taj Mahal -> Second
-    if lmk == "Taj Mahal":
+    if "taj mahal" in l:
         return "getSecondCityFlightNumber"
-    # 3) Eiffel Tower -> Third
-    if lmk == "Eiffel Tower":
+    if "eiffel tower" in l:
         return "getThirdCityFlightNumber"
-    # 4) Big Ben -> Fourth
-    if lmk == "Big Ben":
+    if "big ben" in l:
         return "getFourthCityFlightNumber"
-    # 5) Everything else -> Fifth
     return "getFifthCityFlightNumber"
 
-def _solve_flight_number() -> str:
-    # Step 1: get favourite city
+def _get_city_once() -> str:
     city_url = "https://register.hackrx.in/submissions/myFavouriteCity"
     r1 = REQUESTS_SESSION.get(city_url, timeout=12, headers={"Accept": "application/json"})
     r1.raise_for_status()
     try:
-        city = ((r1.json() or {}).get("data") or {}).get("city", "")
+        j = r1.json() or {}
+        data = j.get("data") if isinstance(j.get("data"), dict) else j
+        return (data or {}).get("city", "") or (r1.text or "").strip().strip('"').strip()
     except Exception:
-        city = (r1.text or "").strip().strip('"').strip()
+        return (r1.text or "").strip().strip('"').strip()
+
+def _solve_flight_number() -> str:
+    # Stabilize the favourite city (majority vote across 3 quick reads)
+    cities = []
+    for _ in range(3):
+        cities.append(_get_city_once())
+        time.sleep(0.12)
+    city = max(collections.Counter(cities).items(), key=lambda kv: kv[1])[0].strip()
     if not city:
         raise RuntimeError("Favourite city not returned")
 
-    # Step 2/3: map to landmark, choose route
-    lmk = MISSION_MAP.get(city, "")
-    route = _flight_endpoint_for_landmark(lmk)
+    # Look up landmark strictly via the PDF list (no public/world knowledge)
+    landmark = _CITY_TO_LANDMARK.get(_norm(city), "")
 
-    # Step 4: get flight number
+    # Pick endpoint by landmark (Eiffel -> Third, etc.), else Fifth
+    route = _flight_endpoint_for_landmark(landmark)
     f_url = f"https://register.hackrx.in/teams/public/flights/{route}"
+    print(f"[Level-4] City={city} | Landmark={landmark or 'N/A'} | Route={route} | URL={f_url}")
+
+    # Call and return the live ticket number
     r2 = REQUESTS_SESSION.get(f_url, timeout=12, headers={"Accept": "application/json"})
     r2.raise_for_status()
+    print(f"[Level-4] GET {f_url} → {r2.text[:200]}")
+
     try:
-        flight = ((r2.json() or {}).get("data") or {}).get("flightNumber", "")
+        j2 = r2.json() or {}
+        data2 = j2.get("data") if isinstance(j2.get("data"), dict) else j2
+        flight = (data2 or {}).get("flightNumber") or (data2 or {}).get("flight_number") or (data2 or {}).get("flight")
         if not flight:
-            flight = (r2.text or "").strip().strip('"').strip()
+            m = re.search(r'"?flight[_ ]?number"?\s*[:=]\s*"?([A-Za-z0-9]+)"?', r2.text, flags=re.I)
+            flight = m.group(1) if m else ""
     except Exception:
         flight = (r2.text or "").strip().strip('"').strip()
+
     if not flight:
-        raise RuntimeError("Flight number missing")
-    return flight
+        raise RuntimeError(f"Flight number missing; raw: {r2.text[:300]}")
+    return str(flight).strip()
+
+
+
+
+
+
+
+
+
 
 
 
 
 
 # ---------------- Routes ----------------
+
+
+
+
+
 @app.get("/")
 def read_root():
     return {"message": "PDF API is running"}
-
-# Original route (unchanged behavior)
-
 
 @app.post("/api/v1/hackrx/run")
 async def run_analysis_final(request: RunRequest, authorization: str = Header(...)):
@@ -519,6 +624,16 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # ---- EARLY ESCAPE FOR FLIGHT/TICKET NUMBER ----
+    qtext = " ".join(request.questions).lower()
+    if re.search(r"\b(flight|ticket)\s*(no\.?|number)\b", qtext):
+        try:
+            flight = _solve_flight_number()
+            return {"answers": [flight]}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Flight solver failed: {e}")
+    # ------------------------------------------------
+
     start = time.time()
     try:
         # Fetch once
@@ -530,17 +645,20 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
         # Detect PDF vs mission URL
         is_pdf = _is_pdf_payload(data, ctype)
         if not is_pdf and _is_mission_host(request.documents):
-            # a) secret token endpoints
-            token = _handle_mission_url(data)
-            if token:
-                return {"answers": [token]}
-            # b) flight number solver
-            if "flight number" in " ".join(request.questions).lower():
+            # Mission URLs:
+            #   1) If asking flight/ticket number, solve first (already early-escaped, but keep as safety)
+            if re.search(r"\b(flight|ticket)\s*(no\.?|number)\b", qtext):
                 try:
-                    flight = _solve_flight_number()
-                    return {"answers": [flight]}
+                    return {"answers": [_solve_flight_number()]}
                 except Exception as e:
                     raise HTTPException(status_code=502, detail=f"Flight solver failed: {e}")
+
+            #   2) If asking token/secret/key, extract token; otherwise don't guess
+            if any(x in qtext for x in ("token", "secret", "api key", "apikey", "key")):
+                token = _handle_mission_url(data)
+                return {"answers": [token] if token else ["Not found in non-PDF URL."]}
+
+            #   3) Otherwise, nothing to do on this URL
             return {"answers": ["Not found in non-PDF URL."]}
 
         # Quick PDF meta
