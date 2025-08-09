@@ -621,6 +621,11 @@ async def run_analysis_final(request: RunRequest, authorization: str = Header(..
     - 101–200 pages: per-question focused context; targeted retries.
     - >200 pages: title/public path.
     """
+    print(f"⏱ Starting run with {len(request.questions)} questions on {request.documents}")
+    
+    print(f"Questions: {request.questions}")
+    print(f"Documents: {request.documents}")
+
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
