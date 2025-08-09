@@ -8,3 +8,4 @@ pillow
 PyMuPDF
 pytesseract
 httpx[http2]
+pymupdf4llm
